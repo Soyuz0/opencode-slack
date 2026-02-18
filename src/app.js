@@ -5,11 +5,13 @@
  * - Mention @opencode or DM the bot to start a conversation
  * - Reply in the thread to continue the same session
  * - Set working directory per-conversation with:  dir:/path/to/project
+ * - Interactive folder picker for new conversations
  * - Every tool call, file change, and response streams in real-time
  */
 
 import "dotenv/config";
 import path from "node:path";
+import fs from "node:fs";
 import pkg from "@slack/bolt";
 const { App } = pkg;
 import { runOpencode } from "./opencode.js";
@@ -23,9 +25,19 @@ const SLACK_APP_TOKEN = requiredEnv("SLACK_APP_TOKEN");
 const SLACK_SIGNING_SECRET = requiredEnv("SLACK_SIGNING_SECRET");
 const ALLOWED_USER_ID = requiredEnv("ALLOWED_USER_ID");
 const DEFAULT_DIR = process.env.OPENCODE_DEFAULT_DIR || process.cwd();
+const BROWSE_ROOT = process.env.OPENCODE_BROWSE_ROOT || process.env.HOME || "/";
+
+// Bookmarked projects — comma-separated paths
+const PROJECTS = (process.env.OPENCODE_PROJECTS || "")
+  .split(",")
+  .map((p) => p.trim())
+  .filter(Boolean);
 
 // How often to update the Slack message while streaming (ms)
 const UPDATE_INTERVAL = 1500;
+
+// Max folders to show in browser (Slack limits actions per block)
+const MAX_BROWSE_FOLDERS = 20;
 
 // Track active child processes for graceful shutdown
 const activeProcesses = new Set();
@@ -54,7 +66,6 @@ bolt.event("app_mention", async ({ event, client, say }) => {
     return;
   }
 
-  // Strip the bot mention from the text
   const text = event.text.replace(/<@[A-Z0-9]+>/g, "").trim();
   if (!text) {
     await say({ text: "Send me a message and I'll pass it to OpenCode!", thread_ts: event.ts });
@@ -79,15 +90,12 @@ bolt.event("message", async ({ event, client }) => {
     ts: event.ts,
   }));
 
-  // Skip bot messages, message_changed, etc.
   if (event.subtype) return;
   if (event.bot_id) return;
   if (!event.text) return;
   if (!isAllowed(event.user)) return;
 
-  // Check if this is a DM
   const isDM = event.channel_type === "im";
-  // Check if this is a thread reply (in a channel where we're already active)
   const isThreadReply = event.thread_ts && event.thread_ts !== event.ts;
 
   if (!isDM && !isThreadReply) return;
@@ -95,7 +103,7 @@ bolt.event("message", async ({ event, client }) => {
   // For thread replies, only respond if we have an active session for this thread
   if (isThreadReply) {
     const thread = getThread(event.thread_ts);
-    if (!thread) return; // Not our thread
+    if (!thread) return;
   }
 
   const threadTs = event.thread_ts || event.ts;
@@ -109,19 +117,31 @@ bolt.event("message", async ({ event, client }) => {
 // ── Core: send message to OpenCode, stream response back ────────────────
 
 async function handleMessage({ text, threadTs, channel, client }) {
-  // Parse directives from the message
   const { message, directory } = parseDirectives(text);
   if (!message) return;
 
-  // Get or create thread state
   let thread = getThread(threadTs);
 
   if (directory) {
     thread = upsertThread(threadTs, { directory });
   }
 
+  // If this is a brand new thread with no directory set, show the folder picker
+  if (!thread && !directory) {
+    upsertThread(threadTs, { pendingMessage: message });
+    await showFolderPicker({ threadTs, channel, client, browsePath: null });
+    return;
+  }
+
   if (!thread) {
     thread = upsertThread(threadTs, { directory: directory || DEFAULT_DIR });
+  }
+
+  // If thread exists but still waiting for folder pick
+  if (thread.pendingMessage && !thread.directory) {
+    thread.queue.push(message);
+    upsertThread(threadTs, { queue: thread.queue });
+    return;
   }
 
   // Queue if busy
@@ -151,6 +171,244 @@ async function handleMessage({ text, threadTs, channel, client }) {
 
   upsertThread(threadTs, { busy: false });
 }
+
+// ── Folder picker ───────────────────────────────────────────────────────
+
+async function showFolderPicker({ threadTs, channel, client, browsePath }) {
+  const blocks = [];
+
+  if (!browsePath) {
+    // ── Initial picker: bookmarks + browse button ──
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: ":file_folder: *Choose a project folder:*" },
+    });
+
+    // Bookmark buttons (if configured)
+    if (PROJECTS.length > 0) {
+      blocks.push({
+        type: "section",
+        text: { type: "mrkdwn", text: "*Bookmarks:*" },
+      });
+
+      // Chunk into rows of 5 (Slack max per actions block)
+      const chunks = chunkArray(PROJECTS, 5);
+      for (const chunk of chunks) {
+        blocks.push({
+          type: "actions",
+          elements: chunk.map((p) => ({
+            type: "button",
+            text: { type: "plain_text", text: truncLabel(path.basename(p) || p), emoji: true },
+            value: JSON.stringify({ action: "select", dir: p, threadTs }),
+            action_id: `folder_select_${p}`,
+          })),
+        });
+      }
+
+      blocks.push({ type: "divider" });
+    }
+
+    // Browse button
+    blocks.push({
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: ":open_file_folder: Browse...", emoji: true },
+          value: JSON.stringify({ action: "browse", dir: BROWSE_ROOT, threadTs }),
+          action_id: "folder_browse",
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: ":fast_forward: Use default", emoji: true },
+          value: JSON.stringify({ action: "select", dir: DEFAULT_DIR, threadTs }),
+          action_id: "folder_use_default",
+        },
+      ],
+    });
+  } else {
+    // ── Browser view: show subdirectories of browsePath ──
+    blocks.push(...buildBrowseBlocks(browsePath, threadTs));
+  }
+
+  const thread = getThread(threadTs);
+
+  if (thread?.pickerTs) {
+    // Update existing picker message
+    try {
+      await client.chat.update({
+        channel,
+        ts: thread.pickerTs,
+        text: "Choose a folder",
+        blocks,
+      });
+    } catch (err) {
+      console.error("[picker update error]", err?.data?.error ?? err.message);
+    }
+  } else {
+    // Post new picker message
+    const result = await client.chat.postMessage({
+      channel,
+      thread_ts: threadTs,
+      text: "Choose a folder",
+      blocks,
+    });
+    upsertThread(threadTs, { pickerTs: result.ts });
+  }
+}
+
+function buildBrowseBlocks(browsePath, threadTs) {
+  const blocks = [];
+  const resolved = path.resolve(browsePath);
+
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: `:open_file_folder: *${resolved}*` },
+  });
+
+  // Navigation: parent + select
+  const parentDir = path.dirname(resolved);
+  const navElements = [];
+
+  if (parentDir !== resolved) {
+    navElements.push({
+      type: "button",
+      text: { type: "plain_text", text: ":arrow_up: Parent", emoji: true },
+      value: JSON.stringify({ action: "browse", dir: parentDir, threadTs }),
+      action_id: "folder_parent",
+    });
+  }
+
+  navElements.push({
+    type: "button",
+    text: { type: "plain_text", text: ":white_check_mark: Use this folder", emoji: true },
+    style: "primary",
+    value: JSON.stringify({ action: "select", dir: resolved, threadTs }),
+    action_id: "folder_select_current",
+  });
+
+  blocks.push({ type: "actions", elements: navElements });
+  blocks.push({ type: "divider" });
+
+  // List subdirectories
+  let subdirs = [];
+  try {
+    const entries = fs.readdirSync(resolved, { withFileTypes: true });
+    subdirs = entries
+      .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+      .map((e) => e.name)
+      .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  } catch (err) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: `:x: Can't read directory: ${err.message}` },
+    });
+    return blocks;
+  }
+
+  if (subdirs.length === 0) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: "_No subdirectories_" },
+    });
+    return blocks;
+  }
+
+  // Show folders — chunk into rows of 5 buttons
+  const shown = subdirs.slice(0, MAX_BROWSE_FOLDERS);
+  const chunks = chunkArray(shown, 5);
+
+  for (const chunk of chunks) {
+    blocks.push({
+      type: "actions",
+      elements: chunk.map((name) => ({
+        type: "button",
+        text: { type: "plain_text", text: truncLabel(name + "/"), emoji: true },
+        value: JSON.stringify({ action: "browse", dir: path.join(resolved, name), threadTs }),
+        action_id: `folder_cd_${name}`,
+      })),
+    });
+  }
+
+  if (subdirs.length > MAX_BROWSE_FOLDERS) {
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `_...and ${subdirs.length - MAX_BROWSE_FOLDERS} more folders_` }],
+    });
+  }
+
+  return blocks;
+}
+
+// ── Action handlers (button clicks) ─────────────────────────────────────
+
+// Match all button action_ids that start with "folder_"
+bolt.action(/^folder_/, async ({ action, ack, body, client }) => {
+  await ack();
+
+  if (!isAllowed(body.user?.id)) return;
+
+  let payload;
+  try {
+    payload = JSON.parse(action.value);
+  } catch {
+    console.error("[action] bad payload", action.value);
+    return;
+  }
+
+  const { action: act, dir, threadTs } = payload;
+  const channel = body.channel?.id;
+
+  console.log("[folder action]", act, dir, "thread:", threadTs);
+
+  if (act === "browse") {
+    upsertThread(threadTs, { browsePath: dir });
+    await showFolderPicker({ threadTs, channel, client, browsePath: dir });
+  } else if (act === "select") {
+    await folderSelected({ dir, threadTs, channel, client });
+  }
+});
+
+async function folderSelected({ dir, threadTs, channel, client }) {
+  const thread = getThread(threadTs);
+  if (!thread) return;
+
+  const pendingMessage = thread.pendingMessage;
+
+  // Update picker message to show selection
+  if (thread.pickerTs) {
+    try {
+      await client.chat.update({
+        channel,
+        ts: thread.pickerTs,
+        text: `Folder: ${dir}`,
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: `:white_check_mark: *Folder:* \`${dir}\`` },
+          },
+        ],
+      });
+    } catch (err) {
+      console.error("[picker replace error]", err?.data?.error ?? err.message);
+    }
+  }
+
+  // Set directory, clear pending state
+  upsertThread(threadTs, {
+    directory: dir,
+    pendingMessage: null,
+    pickerTs: null,
+    browsePath: null,
+  });
+
+  // Now run the pending message
+  if (pendingMessage) {
+    await handleMessage({ text: pendingMessage, threadTs, channel, client });
+  }
+}
+
+// ── Process a single opencode run ───────────────────────────────────────
 
 async function processMessage({ message, threadTs, channel, client }) {
   const thread = getThread(threadTs);
@@ -182,9 +440,8 @@ async function processMessage({ message, threadTs, channel, client }) {
           blocks: accumulator.blocks(),
         });
       } catch (err) {
-        // Rate limit or other Slack error — just skip this update
         if (err?.data?.error === "ratelimited") {
-          // Back off and retry on next event
+          // Back off
         } else {
           console.error("[slack update error]", err?.data?.error ?? err.message);
         }
@@ -237,10 +494,8 @@ async function processMessage({ message, threadTs, channel, client }) {
     emitter.on("done", async ({ sessionID, exitCode }) => {
       console.log("[opencode done]", { sessionID, exitCode, finished: accumulator.isFinished });
       activeProcesses.delete(emitter);
-      // Clear any pending timer and do a final update
       if (updateTimer) clearTimeout(updateTimer);
 
-      // Save session ID for continuation
       if (sessionID) {
         upsertThread(threadTs, { sessionID });
       }
@@ -248,7 +503,6 @@ async function processMessage({ message, threadTs, channel, client }) {
       try {
         const blocks = accumulator.blocks();
         console.log("[final update]", blocks.length, "blocks");
-        // If exit was non-zero and we have no content, show error
         if (exitCode !== 0 && blocks.length <= 1) {
           blocks.unshift({
             type: "section",
@@ -275,17 +529,14 @@ async function processMessage({ message, threadTs, channel, client }) {
 }
 
 // ── Directive parsing ───────────────────────────────────────────────────
-// Users can prefix their message with  dir:/some/path  to set the working dir
 
 function parseDirectives(text) {
   let directory = null;
   let message = text;
 
-  // Match dir:/path/to/thing at start of message
   const dirMatch = message.match(/^dir:(\S+)\s*/);
   if (dirMatch) {
     const raw = dirMatch[1];
-    // Resolve and validate — must be an absolute path, no traversal tricks
     const resolved = path.resolve(raw);
     directory = resolved;
     message = message.slice(dirMatch[0].length).trim();
@@ -294,7 +545,20 @@ function parseDirectives(text) {
   return { message, directory };
 }
 
-// ── Startup ─────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+function truncLabel(str, max = 24) {
+  if (str.length <= max) return str;
+  return str.slice(0, max - 1) + "…";
+}
 
 function requiredEnv(name) {
   const val = process.env[name];
@@ -305,11 +569,15 @@ function requiredEnv(name) {
   return val;
 }
 
+// ── Startup ─────────────────────────────────────────────────────────────
+
 (async () => {
   await bolt.start();
   console.log("⚡ OpenCode Slack bot is running (Socket Mode)");
   console.log(`   Allowed user: ${ALLOWED_USER_ID}`);
   console.log(`   Default dir:  ${DEFAULT_DIR}`);
+  console.log(`   Browse root:  ${BROWSE_ROOT}`);
+  console.log(`   Bookmarks:    ${PROJECTS.length ? PROJECTS.join(", ") : "(none)"}`);
 })();
 
 // ── Graceful shutdown ───────────────────────────────────────────────────
