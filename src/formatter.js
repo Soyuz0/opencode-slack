@@ -6,7 +6,7 @@
  * to get the current Slack blocks for a chat.update call.
  *
  * Slack limits: 50 blocks per message, 3000 chars per text block.
- * We handle truncation gracefully.
+ * Long text is split across multiple blocks instead of being truncated.
  */
 
 const MAX_TEXT_LEN = 2900; // leave margin under 3000
@@ -35,7 +35,6 @@ export function createAccumulator() {
         case "step_start": {
           stepCount++;
           if (stepCount > 1) {
-            // Flush any prior text before new step
             if (currentText) {
               parts.push({ type: "text", data: currentText });
               currentText = "";
@@ -50,7 +49,6 @@ export function createAccumulator() {
         }
 
         case "tool_use": {
-          // Flush text before tool block
           if (currentText) {
             parts.push({ type: "text", data: currentText });
             currentText = "";
@@ -77,7 +75,6 @@ export function createAccumulator() {
           break;
         }
 
-        // Thinking / reasoning blocks (some models emit these)
         case "thinking": {
           if (currentText) {
             parts.push({ type: "text", data: currentText });
@@ -96,27 +93,24 @@ export function createAccumulator() {
     blocks() {
       const blocks = [];
 
-      // Render all accumulated parts
       for (const p of parts) {
         if (blocks.length >= MAX_BLOCKS) break;
         switch (p.type) {
           case "text":
-            blocks.push(markdownSection(truncate(p.data)));
+            blocks.push(...splitTextBlocks(p.data));
             break;
           case "tool":
             blocks.push(...toolBlocks(p.data));
             break;
           case "thinking":
-            blocks.push(
-              markdownSection(`>_*Thinking:*_\n>${truncate(p.data, 1500).split("\n").join("\n>")}`)
-            );
+            blocks.push(...splitThinkingBlocks(p.data));
             break;
         }
       }
 
       // Render current streaming text (not yet flushed)
       if (currentText && blocks.length < MAX_BLOCKS) {
-        blocks.push(markdownSection(truncate(currentText)));
+        blocks.push(...splitTextBlocks(currentText));
       }
 
       // Status indicator
@@ -144,7 +138,6 @@ export function createAccumulator() {
         blocks.push(contextBlock("(output truncated — too many blocks for Slack)"));
       }
 
-      // Slack requires at least one block
       if (blocks.length === 0) {
         blocks.push(contextBlock("Processing..."));
       }
@@ -158,7 +151,66 @@ export function createAccumulator() {
   };
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────
+// ── Text splitting ────────────────────────────────────────────────────
+
+/**
+ * Splits long text into multiple Slack section blocks,
+ * breaking at newlines to keep content readable.
+ */
+function splitTextBlocks(text) {
+  if (!text) return [];
+  const chunks = splitAtBoundary(text, MAX_TEXT_LEN);
+  return chunks.map((chunk) => markdownSection(chunk));
+}
+
+/**
+ * Splits long thinking text into multiple quoted blocks.
+ */
+function splitThinkingBlocks(text) {
+  if (!text) return [];
+  const chunks = splitAtBoundary(text, 1400); // smaller because of > prefix overhead
+  return chunks.map((chunk) =>
+    markdownSection(`>_*Thinking:*_\n>${chunk.split("\n").join("\n>")}`)
+  );
+}
+
+/**
+ * Splits a string into chunks of at most `max` characters,
+ * preferring to break at newline boundaries.
+ */
+function splitAtBoundary(str, max) {
+  if (str.length <= max) return [str];
+
+  const chunks = [];
+  let remaining = str;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= max) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Find the last newline within the limit
+    let splitAt = remaining.lastIndexOf("\n", max);
+
+    // If no newline found, try splitting at a space
+    if (splitAt <= 0) {
+      splitAt = remaining.lastIndexOf(" ", max);
+    }
+
+    // If still no good split point, hard-split at max
+    if (splitAt <= 0) {
+      splitAt = max;
+    }
+
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n/, ""); // trim leading newline
+  }
+
+  return chunks;
+}
+
+// ── Tool formatting ───────────────────────────────────────────────────
 
 function formatTool(part) {
   const tool = part?.tool ?? "unknown";
@@ -178,25 +230,21 @@ function toolBlocks({ tool, title, status, input, output }) {
 
   blocks.push(markdownSection(header));
 
-  // Show condensed input
+  // Show condensed input — split if long
   const inputStr = formatToolInput(tool, input);
   if (inputStr) {
-    blocks.push(markdownSection(`\`\`\`\n${truncate(inputStr, 1500)}\n\`\`\``));
+    const inputChunks = splitAtBoundary(inputStr, 1400);
+    for (const chunk of inputChunks) {
+      blocks.push(markdownSection(`\`\`\`\n${chunk}\n\`\`\``));
+    }
   }
 
-  // Show output if completed
+  // Show output if completed — split if long
   if (status === "completed" && output) {
     const outStr = typeof output === "string" ? output : JSON.stringify(output, null, 2);
-    if (outStr.length > 300) {
-      // Collapsed-style: just show first/last few lines
-      const lines = outStr.split("\n");
-      const preview =
-        lines.length > 10
-          ? [...lines.slice(0, 5), `... (${lines.length - 10} more lines)`, ...lines.slice(-5)].join("\n")
-          : outStr;
-      blocks.push(markdownSection(`\`\`\`\n${truncate(preview, 1500)}\n\`\`\``));
-    } else {
-      blocks.push(markdownSection(`\`\`\`\n${outStr}\n\`\`\``));
+    const outputChunks = splitAtBoundary(outStr, 1400);
+    for (const chunk of outputChunks) {
+      blocks.push(markdownSection(`\`\`\`\n${chunk}\n\`\`\``));
     }
   }
 
@@ -209,7 +257,7 @@ function formatToolInput(tool, input) {
     case "write":
       return `write → ${input.filePath ?? "?"}\n${input.content ?? ""}`;
     case "edit":
-      return `edit → ${input.filePath ?? "?"}\n- ${truncate(input.oldString ?? "", 200)}\n+ ${truncate(input.newString ?? "", 200)}`;
+      return `edit → ${input.filePath ?? "?"}\n- ${input.oldString ?? ""}\n+ ${input.newString ?? ""}`;
     case "read":
       return `read → ${input.filePath ?? "?"}`;
     case "bash":
@@ -225,6 +273,8 @@ function formatToolInput(tool, input) {
   }
 }
 
+// ── Block helpers ─────────────────────────────────────────────────────
+
 function markdownSection(text) {
   return {
     type: "section",
@@ -237,12 +287,6 @@ function contextBlock(text) {
     type: "context",
     elements: [{ type: "mrkdwn", text }],
   };
-}
-
-function truncate(str, max = MAX_TEXT_LEN) {
-  if (!str) return "";
-  if (str.length <= max) return str;
-  return str.slice(0, max) + "\n... (truncated)";
 }
 
 function fmtNum(n) {
